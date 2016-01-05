@@ -2,15 +2,17 @@ import asyncio
 import json
 import logging
 import weakref
+import sys
+import time
 
-from . import message as msg
+import message as msg
 
 logging.basicConfig(format='%(levelname)s: %(message)s', level=logging.INFO)
 log = logging.getLogger()
 
 
 class BaseTcpClient:
-    READ_SIZE = 1024
+    READ_SIZE = 1024 
 
     def __init__(self, host, port, *, loop=None):
         self.host = host
@@ -40,18 +42,22 @@ class BaseTcpClient:
         if self._read_task:
             self._read_task.cancel()
 
+        self.disconnected()
+
     @asyncio.coroutine
     def _read_loop(self):
         while True:
-            buf = yield from self.r.read(self.READ_SIZE)
-            if len(buf) == 0:
+            try:
+                buf = yield from self.r.read(self.READ_SIZE)
+                if len(buf) == 0:
+                    break
+
+                r = self._process(buf)
+                if asyncio.iscoroutine(r):
+                    yield from r
+            except:
                 break
 
-            r = self._process(buf)
-            if asyncio.iscoroutine(r):
-                yield from r
-
-        self.disconnected()
         self.close()
 
     def _process(self, buf):
@@ -195,6 +201,7 @@ class LocalClient(BaseTcpClient):
         self._data_client = data_client
 
     def disconnected(self):
+        log.info("local client disconnect")
         if self._data_client is None:
             return
 
@@ -232,7 +239,7 @@ class LocalDataClient(BaseDataClient):
                 self._local_client = LocalClient(self.LOCAL_PORT, loop=self.loop)
                 self._local_client.set_data_client(weakref.ref(self))
                 yield from self._local_client.connect()
-                print("local client connect")
+                log.info("local client connect")
             except BaseException as e:
                 print(e)
 
@@ -241,6 +248,7 @@ class LocalDataClient(BaseDataClient):
             self._local_client.send(buf)
 
     def disconnected(self):
+        log.info("data client disconnect")
         super().disconnected()
         if self._local_client:
             self._local_client.close()
@@ -264,7 +272,7 @@ class MyTurnClient(BaseTcpClient):
         self.allocate()
 
     def disconnected(self):
-        print("turn client connected")
+        print("turn client disconnected")
         if hasattr(self, "_disconnected_cb"):
             self._disconnected_cb(self)
 
@@ -366,17 +374,15 @@ class ForeverMyTurnClient:
         if self._client:
             return
 
+        self._client = MyTurnClient(args.host, args.port, loop=loop)
+        self._client.set_cb(self.on_client_disconnected)
         while True:
-            self._client = MyTurnClient(args.host, args.port, loop=loop)
-            self._client.set_cb(self.on_client_disconnected)
             try:
                 yield from asyncio.wait_for(self._client.connect(), 10.0)
                 break
             except:
                 print("turn client connect failed")
-                self._client.close()
                 yield from asyncio.sleep(5.0)
-                continue
 
 
     def on_client_disconnected(self, client):
@@ -393,8 +399,12 @@ if __name__=='__main__':
     args = parser.parse_args()
     log.info("host:%s port:%d local_port:%d" % (args.host, args.port, args.lport))
 
-    LocalDataClient.set_local_port(args.lport)
-    loop = asyncio.get_event_loop()
-    ftc = ForeverMyTurnClient(args.host, args.port, loop=loop)
-    ftc.start()
-    loop.run_forever()
+    try:
+        LocalDataClient.set_local_port(args.lport)
+        loop = asyncio.get_event_loop()
+        ftc = ForeverMyTurnClient(args.host, args.port, loop=loop)
+        ftc.start()
+        loop.run_forever()
+    except Exception as e:
+        print(">>>>>>>>>>>>> quit", e)
+        time.sleep(5.0)

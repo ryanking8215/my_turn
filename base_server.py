@@ -21,13 +21,16 @@ class BaseTcpSession:
     @asyncio.coroutine
     def run(self):
         while True:
-            b = yield from self.r.read(self.READ_SIZE)
-            if len(b) == 0:
-                break
+            try:
+                b = yield from self.r.read(self.READ_SIZE)
+                if len(b) == 0:
+                    break
 
-            r = self._process(b)
-            if asyncio.iscoroutine(r):
-                yield from r
+                r = self._process(b)
+                if asyncio.iscoroutine(r):
+                    yield from r
+            except:
+                break
 
         self.disconnected()
         self.close()
