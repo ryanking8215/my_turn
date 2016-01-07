@@ -388,7 +388,7 @@ class MyTurnClient(BaseTcpClient):
                 log.error("Turn client refresh failed too many times")
                 break
 
-            yield from asyncio.sleep(10.0)
+            yield from asyncio.sleep(30.0)
 
         self.close()
 
