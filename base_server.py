@@ -2,7 +2,7 @@ import asyncio
 import weakref
 
 class BaseTcpSession:
-    READ_SIZE = 1024
+    READ_SIZE = 4096
 
     def __init__(self, r, w, server, *, loop=None):
         self.r = r

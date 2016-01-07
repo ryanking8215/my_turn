@@ -11,9 +11,12 @@ import copy
 from .base_server import *
 from . import message as msg
 
-logging.basicConfig(format='%(levelname)s: %(message)s', level=logging.INFO)
-log = logging.getLogger()
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)-8s  %(message)s', level=logging.INFO)
+logging.getLogger('asyncio').setLevel(logging.WARN)
+log = logging.getLogger('server')
 
+# 是否启用保活检测
+USE_TURN_CLINT_LIVE_CHECK = False
 
 class DataSession(BaseTcpSession):
     ''' 数据通道会话, 即内网机器服务的数据通道
@@ -25,7 +28,7 @@ class DataSession(BaseTcpSession):
         log.info("%r connected" % self)
 
     def disconnected(self):
-        log.info("%r disconnected" % self)
+        log.warn("%r disconnected" % self)
         try:
             self.server.allocation.del_session(self.connection_id)
             # del self.server.allocation.data_sessions[self.connection_id]
@@ -68,7 +71,7 @@ class DataSession(BaseTcpSession):
                 del buf[:head.payload_len+msg.Head.size()]
 
     def process_ConnectionBind(self, head, payload):
-        log.info("process bind")
+        log.info("%r process bind" % self)
         try:
             payload = json.loads(payload.decode())
             connection_id = payload.get('connection_id')
@@ -91,7 +94,7 @@ class DataSession(BaseTcpSession):
 
             self.send_response(head, json.dumps(rsp).encode())
         except Exception as e:
-            print(e)
+            log.error(e)
 
     def set_relay_session(self, relay_session):
         self._relay_session = relay_session
@@ -117,7 +120,7 @@ class DataSession(BaseTcpSession):
         self.w.write(buf)
 
     def __repr__(self):
-        return '<DataSession(id:%s)>' % self.connection_id
+        return '<DataSession(id:{}, {})>'.format(self.connection_id, self.w.get_extra_info('peername'))
 
 class DataServer(BaseTcpServer):
     session_class = DataSession
@@ -135,11 +138,12 @@ class RelaySession(BaseTcpSession):
         self._buf = bytearray()
         self.connection_id = str(uuid.uuid4())
         self._data_session = None
-        log.info("relay session connected %s server:%r" % (self.connection_id, self.server))
+        # log.info("relay session connected %s server:%r" % (self.connection_id, self.server))
         self.server.allocation.relay_connected(self)
+        log.info('%r connected' % self)
 
     def disconnected(self):
-        log.info("%r disconnected" % self)
+        log.warn("%r disconnected" % self)
         try:
             self.server.allocation.del_session(self.connection_id)
             # del self.server.allocation.relay_sessions[self.connection_id]
@@ -162,7 +166,8 @@ class RelaySession(BaseTcpSession):
         self._data_session = data_session
 
     def __repr__(self):
-        return '<RelaySession(id:%s)>' % self.connection_id
+        return '<RelaySession(id:{}, l:{} r:{})>'.format(self.connection_id, self.w.get_extra_info('peername'), self.w.get_extra_info('sockname'))
+        # return '<RelaySession(id:%s)>' % self.connection_id
 
 
 class RelayServer(BaseTcpServer):
@@ -187,7 +192,7 @@ class Allocation:
     @asyncio.coroutine
     def start_relay_server(self):
         port, sock = FindTcpPortByBind.find()
-        self.relay_server = RelayServer(weakref.proxy(self), None, loop=self.turn_session.loop, sock=sock)
+        self.relay_server = RelayServer(self, None, loop=self.turn_session.loop, sock=sock)
         yield from self.relay_server.run()
         # self.relay_server.start()
         # log.info("%r run" % self.relay_server)
@@ -195,7 +200,7 @@ class Allocation:
     @asyncio.coroutine
     def start_data_server(self):
         port, sock = FindTcpPortByBind.find()
-        self.data_server = DataServer(weakref.proxy(self), None, loop=self.turn_session.loop, sock=sock)
+        self.data_server = DataServer(self, None, loop=self.turn_session.loop, sock=sock)
         yield from self.data_server.run()
         # self.relay_server.start()
         # log.info("%r run" % self.data_server)
@@ -213,14 +218,14 @@ class Allocation:
         self.turn_session.send_request(head, json.dumps(rsp).encode())
 
     def close(self):
-        log.info("allocation: close all sessions")
+        log.warn("%r close my sessions" % self)
         # close all sessions
         for s in self.relay_sessions.values():
             s.close()
         for s in self.data_sessions.values():
             s.close()
 
-        log.info("allocation: close relay and data server")
+        log.warn("%r close my relay and data server" % self)
         if self.relay_server:
             self.relay_server.close()
         if self.data_server:
@@ -249,6 +254,9 @@ class Allocation:
         if relay_session:
             relay_session.close()
 
+    def __repr__(self):
+        return '<Allocation(session:%r)>' % self.turn_session.__repr__()
+
 
 class MyTurnSession(BaseTcpSession):
     ''' 转发服务连接上来的会话
@@ -256,14 +264,20 @@ class MyTurnSession(BaseTcpSession):
     MAX_SEQ = 2**16
 
     def connected(self):
+        log.info('%r connected' % self)
         self._allocation = None
         self._seq = 0
         self._buf = bytearray()
+        self._live_watchdog = 0
+        if USE_TURN_CLINT_LIVE_CHECK:
+            self._live_check_task = asyncio.async(self._live_check())
 
     def disconnected(self):
-        log.warn("turn session peer disconnected")
+        log.warn("%r disconnected" % self)
         if self._allocation:
             self._allocation.close()
+        if hasattr(self, '_live_check_task'):
+            self._live_check_task.cancel()
 
     @asyncio.coroutine
     def _process(self, buf):
@@ -305,13 +319,13 @@ class MyTurnSession(BaseTcpSession):
         else:
             payload = json.loads(payload.decode())
 
-            self._allocation = Allocation(weakref.proxy(self))
+            self._allocation = Allocation(self)
             # start relay and data server
             try:
                 yield from self._allocation.start_relay_server()
                 yield from self._allocation.start_data_server()
             except Exception as e:
-                print(e)
+                log.error(e)
                 
 
             rsp = {
@@ -326,6 +340,14 @@ class MyTurnSession(BaseTcpSession):
             'code': 200,
         }
         self.send_response(head, json.dumps(rsp).encode())
+
+    def process_Refresh(self, head, paylod):
+        rsp = {
+            'code': 200,
+        }
+        self.send_response(head, json.dumps(rsp).encode())
+        log.debug("%r feed" % self)
+        self._live_watchdog = 0
 
     def send_response(self, req_head, payload):
         head = copy.deepcopy(req_head)
@@ -349,6 +371,21 @@ class MyTurnSession(BaseTcpSession):
         if self._seq >= self.MAX_SEQ:
             self._seq = 0
         return self._seq
+
+    def _live_check(self):
+        self._live_watchdog = 0
+        while True:
+            log.debug("%r check %d" % (self, self._live_watchdog))
+            self._live_watchdog = self._live_watchdog+1
+            yield from asyncio.sleep(1.0)
+            if self._live_watchdog>=120:
+                break
+
+        log.warn("%r live check timeout" % self)
+        self.close()
+
+    def __repr__(self):
+        return "<TurnSession({})>".format(self.w.get_extra_info('peername'))
 
 
 class FindTcpPortByNetstat:

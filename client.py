@@ -7,12 +7,12 @@ import time
 
 import message as msg
 
-logging.basicConfig(format='%(levelname)s: %(message)s', level=logging.INFO)
-log = logging.getLogger()
-
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)-8s  %(message)s', level=logging.INFO)
+logging.getLogger('asyncio').setLevel(logging.WARN)
+log = logging.getLogger('client')
 
 class BaseTcpClient:
-    READ_SIZE = 1024 
+    READ_SIZE = 4096 
 
     def __init__(self, host, port, *, loop=None):
         self.host = host
@@ -176,12 +176,12 @@ class BaseDataClient(BaseTcpClient):
             if payload['code'] == 200:
                 self._is_binded = True
 
-            print("bind ok")
+            log.info("bind ok")
             return
         except BaseException as e:
-            print(e)
+            log.error(e)
 
-        print("failed")
+        log.warn("failed")
         # raise RuntimeError("bind error")
 
     def process_binded_data(self, buf):
@@ -241,14 +241,14 @@ class LocalDataClient(BaseDataClient):
                 yield from self._local_client.connect()
                 log.info("local client connect")
             except BaseException as e:
-                print(e)
+                log.error(e)
 
     def process_binded_data(self, buf):
         if self._local_client:
             self._local_client.send(buf)
 
     def disconnected(self):
-        log.info("data client disconnect")
+        log.warn("data client disconnect")
         super().disconnected()
         if self._local_client:
             self._local_client.close()
@@ -269,10 +269,14 @@ class MyTurnClient(BaseTcpClient):
         # {connection_id: data_client}
         self._data_clients = {}
 
+        self._refresh_ack_ev = asyncio.Event()
         self.allocate()
 
     def disconnected(self):
-        print("turn client disconnected")
+        log.warn("turn client disconnected")
+        if hasattr(self, "_live_task"):
+            self._live_task.cancel()
+
         if hasattr(self, "_disconnected_cb"):
             self._disconnected_cb(self)
 
@@ -319,10 +323,12 @@ class MyTurnClient(BaseTcpClient):
         log.info("allocate ok: %s" % relay_address)
         self._is_allocated = True
 
+        self._live_task = asyncio.async(self._live_loop())
+
     def process_ConnectionAttamp(self, head, payload):
         log.info("process ConnectionAttamp")
         payload = json.loads(payload.decode())
-        log.info(payload)
+        log.debug(payload)
         connection_id = payload.get('connection_id')
         data_address = payload.get('data_address')
         if connection_id is None or data_address is None:
@@ -332,14 +338,18 @@ class MyTurnClient(BaseTcpClient):
             v = data_address.split(':')
             host = v[0]
             port = int(v[1])
-            print(host, port)
+            log.info("data server: %s %d" % (host, port))
             dc = self.data_client_class(connection_id, host, port, loop=self.loop)
             dc.start()
         except Exception as e:
-            print(e)
+            log.error(e)
 
         self._data_clients[connection_id] = dc
 
+    def process_RefreshAck(self, head, payload):
+        log.debug("process Refresh Ack")
+        payload = json.loads(payload.decode())
+        self._refresh_ack_ev.set()
 
     def _send_msg(self, head, payload):
         head.payload_len = len(payload)
@@ -357,6 +367,30 @@ class MyTurnClient(BaseTcpClient):
         if self._seq >= self.MAX_SEQ:
             self._seq = 0
         return self._seq
+
+    @asyncio.coroutine
+    def _live_loop(self):
+        log.info("start refresh task")
+        head = msg.Head(command=msg.Command.Refresh)
+        req = {}
+        err_times = 0
+        while True:
+            log.debug("turn client refresh")
+            self.send_request(head, json.dumps(req).encode())
+            try:
+                yield from asyncio.wait_for(self._refresh_ack_ev.wait(), timeout=5.0)
+                err_times = 0
+            except Exception as e:
+                err_times = err_times+1
+                log.warn("turn client refresh error times:%d" % err_times)
+
+            if err_times>=5:
+                log.error("Turn client refresh failed too many times")
+                break
+
+            yield from asyncio.sleep(30.0)
+
+        self.close()
 
 
 class ForeverMyTurnClient:
@@ -381,7 +415,7 @@ class ForeverMyTurnClient:
                 yield from asyncio.wait_for(self._client.connect(), 10.0)
                 break
             except:
-                print("turn client connect failed")
+                log.error("turn client connect failed")
                 yield from asyncio.sleep(5.0)
 
 
@@ -406,5 +440,5 @@ if __name__=='__main__':
         ftc.start()
         loop.run_forever()
     except Exception as e:
-        print(">>>>>>>>>>>>> quit", e)
+        log.error(">>>>>>>>>>>>> quit", e)
         time.sleep(5.0)
